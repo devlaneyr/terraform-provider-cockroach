@@ -37,7 +37,10 @@ import (
 	framework_resource "github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/knownvalue"
+	"github.com/hashicorp/terraform-plugin-testing/plancheck"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
+	"github.com/hashicorp/terraform-plugin-testing/tfjsonpath"
 	"github.com/stretchr/testify/require"
 )
 
@@ -4343,6 +4346,63 @@ func TestCoordinateDedicatedMachinePlan(t *testing.T) {
 		require.True(t, plan.DedicatedConfig.MachineType.IsUnknown())
 		require.True(t, plan.DedicatedConfig.MemoryGib.IsUnknown())
 	})
+
+	// disk_iops is derived from the machine type and the storage size. These
+	// subtests cover the storage side. The machine-type side is already covered
+	// by the resize subtests above.
+	dedStorage := func(storage, iops types.Int64) *DedicatedClusterConfig {
+		return &DedicatedClusterConfig{
+			NumVirtualCpus: v4, MachineType: mtSmall, MemoryGib: types.Float64Value(8),
+			StorageGib: storage, DiskIops: iops,
+		}
+	}
+	storage15, storage100 := types.Int64Value(15), types.Int64Value(100)
+	iops300 := types.Int64Value(300)
+	// A fresh slice per use: coordinateDedicatedMachinePlan mutates plan.Regions,
+	// so config, state and plan must not share backing storage.
+	regions := func() []Region { return []Region{region("us-east-1", nullI, nullS)} }
+
+	t.Run("storage change recomputes disk_iops", func(t *testing.T) {
+		config := &CockroachCluster{DedicatedConfig: dedStorage(storage100, nullI), Regions: regions()}
+		state := &CockroachCluster{DedicatedConfig: dedStorage(storage15, iops300), Regions: regions()}
+		plan := &CockroachCluster{DedicatedConfig: dedStorage(storage100, iops300), Regions: regions()}
+
+		require.True(t, coordinateDedicatedMachinePlan(config, plan, state))
+		require.True(t, plan.DedicatedConfig.DiskIops.IsUnknown())
+		// Not a machine resize, so memory_gib must stay known.
+		require.False(t, plan.DedicatedConfig.MemoryGib.IsUnknown())
+	})
+
+	t.Run("unknown storage in config recomputes disk_iops", func(t *testing.T) {
+		// storage_gib interpolated from a resource that has not been applied yet.
+		// Storage may move, so a pinned disk_iops would risk a failed apply.
+		unknownStorage := types.Int64Unknown()
+		config := &CockroachCluster{DedicatedConfig: dedStorage(unknownStorage, nullI), Regions: regions()}
+		state := &CockroachCluster{DedicatedConfig: dedStorage(storage15, iops300), Regions: regions()}
+		plan := &CockroachCluster{DedicatedConfig: dedStorage(unknownStorage, iops300), Regions: regions()}
+
+		require.True(t, coordinateDedicatedMachinePlan(config, plan, state))
+		require.True(t, plan.DedicatedConfig.DiskIops.IsUnknown())
+	})
+
+	t.Run("unchanged storage keeps disk_iops pinned", func(t *testing.T) {
+		config := &CockroachCluster{DedicatedConfig: dedStorage(storage15, nullI), Regions: regions()}
+		state := &CockroachCluster{DedicatedConfig: dedStorage(storage15, iops300), Regions: regions()}
+		plan := &CockroachCluster{DedicatedConfig: dedStorage(storage15, iops300), Regions: regions()}
+
+		require.False(t, coordinateDedicatedMachinePlan(config, plan, state))
+		require.Equal(t, int64(300), plan.DedicatedConfig.DiskIops.ValueInt64())
+	})
+
+	t.Run("disk_iops set in config is left alone across a storage change", func(t *testing.T) {
+		iops500 := types.Int64Value(500)
+		config := &CockroachCluster{DedicatedConfig: dedStorage(storage100, iops500), Regions: regions()}
+		state := &CockroachCluster{DedicatedConfig: dedStorage(storage15, iops300), Regions: regions()}
+		plan := &CockroachCluster{DedicatedConfig: dedStorage(storage100, iops500), Regions: regions()}
+
+		require.False(t, coordinateDedicatedMachinePlan(config, plan, state))
+		require.Equal(t, int64(500), plan.DedicatedConfig.DiskIops.ValueInt64())
+	})
 }
 
 func TestSimplifyClusterVersion(t *testing.T) {
@@ -5029,4 +5089,223 @@ func TestByocEqual(t *testing.T) {
 			require.Equal(t, test.want, equal)
 		})
 	}
+}
+
+// TestIntegrationClusterLabelOnlyPlanNoise validates that changing a single label
+// does not report unrelated computed attributes as "known after apply". Every
+// attribute asserted here is server-assigned but stable across an update.
+func TestIntegrationClusterLabelOnlyPlanNoise(t *testing.T) {
+	clusterName := fmt.Sprintf("%s-label-noise-%s", tfTestPrefix, GenerateRandomString(3))
+	clusterID := uuid.Nil.String()
+	if os.Getenv(CockroachAPIKey) == "" {
+		os.Setenv(CockroachAPIKey, "fake")
+	}
+
+	ctrl := gomock.NewController(t)
+	s := mock_client.NewMockService(ctrl)
+	defer HookGlobal(&NewService, func(c *client.Client) client.Service {
+		return s
+	})()
+
+	region := func(name string) client.Region {
+		return client.Region{
+			Name:            name,
+			NodeCount:       3,
+			SqlDns:          fmt.Sprintf("%s.sql.example.com", name),
+			UiDns:           fmt.Sprintf("%s.ui.example.com", name),
+			InternalDns:     fmt.Sprintf("%s.internal.example.com", name),
+			S3VpcEndpointId: ptr(fmt.Sprintf("vpce-%s", name)),
+		}
+	}
+	cluster := func(labels map[string]string) *client.Cluster {
+		return &client.Cluster{
+			Id:               clusterID,
+			Name:             clusterName,
+			CockroachVersion: minSupportedClusterPatchVersion,
+			Plan:             client.PLANTYPE_ADVANCED,
+			CloudProvider:    client.CLOUDPROVIDERTYPE_AWS,
+			State:            client.CLUSTERSTATETYPE_CREATED,
+			AccountId:        ptr("account-12345"),
+			ParentId:         ptr("root"),
+			DeleteProtection: ptr(client.DELETEPROTECTIONSTATETYPE_DISABLED),
+			Labels:           labels,
+			Config: client.ClusterConfig{
+				Dedicated: &client.DedicatedHardwareConfig{
+					MachineType: "m6i.xlarge", NumVirtualCpus: 4, StorageGib: 15, MemoryGib: 8,
+				},
+			},
+			Regions: []client.Region{region("us-east-1"), region("us-west-2")},
+		}
+	}
+
+	before := cluster(map[string]string{"environment": "staging"})
+	after := cluster(map[string]string{"environment": "production"})
+	current := before
+
+	s.EXPECT().CreateCluster(gomock.Any(), gomock.Any()).Return(before, nil, nil)
+	s.EXPECT().GetBackupConfiguration(gomock.Any(), clusterID).
+		Return(initialBackupConfig, httpOk, nil).AnyTimes()
+	s.EXPECT().GetCluster(gomock.Any(), clusterID).DoAndReturn(
+		func(_ context.Context, _ string) (*client.Cluster, *http.Response, error) {
+			return current, httpOk, nil
+		}).AnyTimes()
+	s.EXPECT().UpdateCluster(gomock.Any(), clusterID, gomock.Any()).DoAndReturn(
+		func(_ context.Context, _ string, _ *client.UpdateClusterSpecification) (*client.Cluster, *http.Response, error) {
+			current = after
+			return after, httpOk, nil
+		})
+	s.EXPECT().DeleteCluster(gomock.Any(), clusterID).Return(nil, httpOk, nil)
+
+	cfg := func(env string) string {
+		return fmt.Sprintf(`
+resource "cockroach_cluster" "test" {
+  name              = "%s"
+  cloud_provider    = "AWS"
+  cockroach_version = "%s"
+  dedicated = { storage_gib = 15, num_virtual_cpus = 4 }
+  regions = [
+    { name = "us-east-1", node_count = 3 },
+    { name = "us-west-2", node_count = 3 },
+  ]
+  labels = { environment = "%s" }
+}
+`, clusterName, minSupportedClusterMajorVersion, env)
+	}
+
+	// Attributes that must stay known in the plan for a label-only change.
+	quietPaths := []tfjsonpath.Path{
+		tfjsonpath.New("account_id"),
+		tfjsonpath.New("parent_id"),
+		tfjsonpath.New("delete_protection"),
+		tfjsonpath.New("regions").AtSliceIndex(0).AtMapKey("sql_dns"),
+		tfjsonpath.New("regions").AtSliceIndex(0).AtMapKey("ui_dns"),
+		tfjsonpath.New("regions").AtSliceIndex(0).AtMapKey("internal_dns"),
+		tfjsonpath.New("regions").AtSliceIndex(0).AtMapKey("private_endpoint_dns"),
+		tfjsonpath.New("regions").AtSliceIndex(0).AtMapKey("s3_vpc_endpoint_id"),
+		tfjsonpath.New("regions").AtSliceIndex(1).AtMapKey("sql_dns"),
+		tfjsonpath.New("regions").AtSliceIndex(1).AtMapKey("ui_dns"),
+		tfjsonpath.New("regions").AtSliceIndex(1).AtMapKey("internal_dns"),
+		tfjsonpath.New("regions").AtSliceIndex(1).AtMapKey("private_endpoint_dns"),
+		tfjsonpath.New("regions").AtSliceIndex(1).AtMapKey("s3_vpc_endpoint_id"),
+	}
+	quietChecks := make([]plancheck.PlanCheck, 0, len(quietPaths))
+	for _, p := range quietPaths {
+		quietChecks = append(quietChecks, plancheck.ExpectKnownValue("cockroach_cluster.test", p, knownvalue.NotNull()))
+	}
+
+	resource.Test(t, resource.TestCase{
+		IsUnitTest:               true,
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{Config: cfg("staging")},
+			{
+				Config: cfg("production"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: quietChecks,
+				},
+			},
+		},
+	})
+}
+
+// TestIntegrationDedicatedClusterStorageResizeDiskIops validates that growing
+// storage_gib marks the server-derived disk_iops unknown, and that memory_gib,
+// which is derived from the machine type alone, stays known.
+func TestIntegrationDedicatedClusterStorageResizeDiskIops(t *testing.T) {
+	clusterName := fmt.Sprintf("%s-storage-iops-%s", tfTestPrefix, GenerateRandomString(3))
+	clusterID := uuid.Nil.String()
+	if os.Getenv(CockroachAPIKey) == "" {
+		os.Setenv(CockroachAPIKey, "fake")
+	}
+
+	ctrl := gomock.NewController(t)
+	s := mock_client.NewMockService(ctrl)
+	defer HookGlobal(&NewService, func(c *client.Client) client.Service {
+		return s
+	})()
+
+	// Same machine type throughout, so memory_gib is stable. Only storage grows,
+	// and the server-derived disk_iops grows with it.
+	cluster := func(storageGib, diskIops int32) *client.Cluster {
+		return &client.Cluster{
+			Id:               clusterID,
+			Name:             clusterName,
+			CockroachVersion: minSupportedClusterPatchVersion,
+			Plan:             client.PLANTYPE_ADVANCED,
+			CloudProvider:    client.CLOUDPROVIDERTYPE_AWS,
+			State:            client.CLUSTERSTATETYPE_CREATED,
+			Config: client.ClusterConfig{
+				Dedicated: &client.DedicatedHardwareConfig{
+					MachineType:    "m6i.xlarge",
+					NumVirtualCpus: 4,
+					MemoryGib:      8,
+					StorageGib:     storageGib,
+					DiskIops:       diskIops,
+				},
+			},
+			Regions: []client.Region{{Name: "us-east-1", NodeCount: 3}},
+		}
+	}
+
+	before := cluster(15, 300)
+	after := cluster(100, 3000)
+	current := before
+
+	s.EXPECT().CreateCluster(gomock.Any(), gomock.Any()).Return(before, nil, nil)
+	s.EXPECT().GetBackupConfiguration(gomock.Any(), clusterID).
+		Return(initialBackupConfig, httpOk, nil).AnyTimes()
+	s.EXPECT().GetCluster(gomock.Any(), clusterID).DoAndReturn(
+		func(_ context.Context, _ string) (*client.Cluster, *http.Response, error) {
+			return current, httpOk, nil
+		}).AnyTimes()
+	s.EXPECT().UpdateCluster(gomock.Any(), clusterID, gomock.Any()).DoAndReturn(
+		func(_ context.Context, _ string, _ *client.UpdateClusterSpecification) (*client.Cluster, *http.Response, error) {
+			current = after
+			return after, httpOk, nil
+		})
+	s.EXPECT().DeleteCluster(gomock.Any(), clusterID).Return(nil, httpOk, nil)
+
+	// disk_iops is deliberately absent from config so the server derives it.
+	cfg := func(storageGib int) string {
+		return fmt.Sprintf(`
+resource "cockroach_cluster" "test" {
+  name              = "%s"
+  cloud_provider    = "AWS"
+  cockroach_version = "%s"
+  dedicated = { storage_gib = %d, num_virtual_cpus = 4 }
+  regions = [{ name = "us-east-1", node_count = 3 }]
+}
+`, clusterName, minSupportedClusterMajorVersion, storageGib)
+	}
+
+	resource.Test(t, resource.TestCase{
+		IsUnitTest:               true,
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: cfg(15),
+				Check:  resource.TestCheckResourceAttr("cockroach_cluster.test", "dedicated.disk_iops", "300"),
+			},
+			{
+				Config: cfg(100),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						// Derived from storage: must be recomputed.
+						plancheck.ExpectUnknownValue("cockroach_cluster.test",
+							tfjsonpath.New("dedicated").AtMapKey("disk_iops")),
+						// Derived from the machine type only: must stay known.
+						plancheck.ExpectKnownValue("cockroach_cluster.test",
+							tfjsonpath.New("dedicated").AtMapKey("memory_gib"),
+							knownvalue.Float64Exact(8)),
+					},
+				},
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("cockroach_cluster.test", "dedicated.disk_iops", "3000"),
+					resource.TestCheckResourceAttr("cockroach_cluster.test", "dedicated.storage_gib", "100"),
+				),
+			},
+		},
+	})
 }
