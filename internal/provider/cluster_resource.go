@@ -38,6 +38,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/float64planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/listplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectplanmodifier"
@@ -89,6 +90,9 @@ var regionSchema = schema.NestedAttributeObject{
 		"ui_dns": schema.StringAttribute{
 			Computed:    true,
 			Description: "DNS name used when connecting to the DB Console for the cluster.",
+			PlanModifiers: []planmodifier.String{
+				stringplanmodifier.UseStateForUnknown(),
+			},
 		},
 		"internal_dns": schema.StringAttribute{
 			Computed:    true,
@@ -99,6 +103,9 @@ var regionSchema = schema.NestedAttributeObject{
 		}, "private_endpoint_dns": schema.StringAttribute{
 			Computed:    true,
 			Description: "Domain name of the cluster for the private endpoint connection. This DNS name is used by GCP Private Service Connect to connect to the cluster.",
+			PlanModifiers: []planmodifier.String{
+				stringplanmodifier.UseStateForUnknown(),
+			},
 		},
 		"node_count": schema.Int64Attribute{
 			Optional: true,
@@ -125,13 +132,19 @@ var regionSchema = schema.NestedAttributeObject{
 			MarkdownDescription: "Machine type identifier per node in this region, e.g., m6.xlarge, n2-standard-4. Set this (or `num_virtual_cpus`) on every region to create a heterogeneous Advanced cluster. Mutually exclusive with the cluster-wide `dedicated.num_virtual_cpus`/`dedicated.machine_type` and with `num_virtual_cpus` on the same region. This attribute requires a feature flag to be enabled; it is recommended to use `num_virtual_cpus` instead. Valid for Advanced clusters only.",
 		},
 		"primary": schema.BoolAttribute{
-			Optional:    true,
-			Computed:    true,
+			Optional: true,
+			Computed: true,
+			// No UseStateForUnknown: primary is coupled across regions. Marking one
+			// region primary clears the flag on the others server-side, so a region
+			// whose config omits primary can still change value at apply.
 			Description: "Set to true to mark this region as the primary for a serverless cluster. Exactly one region must be primary. Dedicated clusters expect to have no primary region.",
 		},
 		"s3_vpc_endpoint_id": schema.StringAttribute{
 			Computed:    true,
 			Description: "The ID of the AWS S3 VPC gateway endpoint for this region. Used to configure S3 bucket policies that restrict access to traffic from this VPC endpoint. Only populated for Advanced clusters on AWS.",
+			PlanModifiers: []planmodifier.String{
+				stringplanmodifier.UseStateForUnknown(),
+			},
 		},
 	},
 }
@@ -167,6 +180,9 @@ func (r *clusterResource) Schema(
 			"account_id": schema.StringAttribute{
 				Computed:    true,
 				Description: "The cloud provider account ID that hosts the cluster. Needed for CMEK and other advanced features.",
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
 			},
 			"customer_cloud_account": schema.SingleNestedAttribute{
 				Optional: true,
@@ -313,10 +329,21 @@ func (r *clusterResource) Schema(
 							int64validator.AtLeast(1),
 						},
 						Description: "Number of disk I/O operations per second that are permitted on each node in the cluster. Only configurable for AWS clusters during creation. For GCP and Azure clusters, this value is ignored and the cloud provider default is used. Omit this attribute to use the server-side default based on machine type and storage size. The provisioned value may differ from the requested value.",
+						// When omitted from config the server derives this from the
+						// machine type and storage size. coordinateDedicatedMachinePlan
+						// resets it to unknown when either of those changes.
+						PlanModifiers: []planmodifier.Int64{
+							int64planmodifier.UseStateForUnknown(),
+						},
 					},
 					"memory_gib": schema.Float64Attribute{
 						Computed:    true,
 						Description: "Memory per node in GiB.",
+						// Derived from the machine type. coordinateDedicatedMachinePlan
+						// resets it to unknown when the plan implies a resize.
+						PlanModifiers: []planmodifier.Float64{
+							float64planmodifier.UseStateForUnknown(),
+						},
 					},
 					"machine_type": schema.StringAttribute{
 						Optional:            true,
@@ -395,11 +422,17 @@ func (r *clusterResource) Schema(
 				Validators: []validator.String{
 					validators.FolderParentID(),
 				},
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
 			},
 			"delete_protection": schema.BoolAttribute{
 				Computed:    true,
 				Optional:    true,
 				Description: "Set to true to enable delete protection on the cluster. If unset, the server chooses the value on cluster creation, and preserves the value on cluster update.",
+				PlanModifiers: []planmodifier.Bool{
+					boolplanmodifier.UseStateForUnknown(),
+				},
 			},
 			"backup_config": schema.SingleNestedAttribute{
 				Computed:            true,
@@ -1873,6 +1906,22 @@ func coordinateDedicatedMachinePlan(config, plan, state *CockroachCluster) bool 
 			plan.DedicatedConfig.MachineType = types.StringUnknown()
 		}
 		changed = true
+	}
+
+	// disk_iops is Optional: a known value in config is the user's and must be
+	// left alone. Otherwise the server derives it from the machine type and the
+	// storage size, so it must be recomputed on a resize or a storage change.
+	// storage_gib is compared config-to-state because the plan can carry a state
+	// value forward via UseStateForUnknown. An unknown config value counts as a
+	// change, since pinning disk_iops when storage may move risks a failed apply.
+	if config.DedicatedConfig != nil && !IsKnown(config.DedicatedConfig.DiskIops) && state.DedicatedConfig != nil {
+		storageChanged := config.DedicatedConfig.StorageGib.IsUnknown() ||
+			(IsKnown(config.DedicatedConfig.StorageGib) &&
+				!config.DedicatedConfig.StorageGib.Equal(state.DedicatedConfig.StorageGib))
+		if (resizing || storageChanged) && !plan.DedicatedConfig.DiskIops.IsUnknown() {
+			plan.DedicatedConfig.DiskIops = types.Int64Unknown()
+			changed = true
+		}
 	}
 	return changed
 }

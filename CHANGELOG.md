@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Bumped version of cockroach-cloud-sdk-go from v8 to v9.
 
+### Fixed
+
+- Reduced `cockroach_cluster` plan noise: `account_id`, `parent_id`,
+  `delete_protection`, `dedicated.memory_gib`, `dedicated.disk_iops`, and the
+  `regions` block's `ui_dns`, `private_endpoint_dns`, and `s3_vpc_endpoint_id` are
+  no longer reported as "known after apply" on updates that don't change them.
+
 ## [1.22.0] - 2026-07-16
 
 ### Added
